@@ -61,14 +61,14 @@ final class ProxyModel: ObservableObject {
     private let debugLog = DebugLog()
     private let logger = Logger(subsystem: "com.local.usbproxy", category: "app")
     private var localServer: ProxyServer?
-    private lazy var keepAliveAudio = KeepAliveAudio(
+    private lazy var keepAliveAudio: KeepAliveAudio = KeepAliveAudio(
         log: { [weak self] line in self?.appendLog(line) },
         onRecovered: { [weak self] in
             self?.localServer?.ensureListening()
             self?.audioKeepAliveActive = self?.keepAliveAudio.isSounding ?? false
         }
     )
-    private lazy var tunnelController = VPNTunnelController { [weak self] line in
+    private lazy var tunnelController: VPNTunnelController = VPNTunnelController { [weak self] line in
         self?.appendLog(line)
     }
 
