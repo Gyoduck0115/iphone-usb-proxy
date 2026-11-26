@@ -96,10 +96,10 @@ final class ProxyModel: ObservableObject {
         }
         self.runMode = initialMode
         self.config = store.loadConfig(default: .appDefault)
-        self.snapshot.listenPort = self.config.listenPort
         self.preventScreenSleep = store.preventScreenSleep
         self.keepAliveAudioEnabled = store.keepAliveAudioEnabled
         self.idleStopTimeout = store.idleStopTimeout
+        self.snapshot.listenPort = self.config.listenPort
 
         #if targetEnvironment(simulator)
         if config.requireCellular {
