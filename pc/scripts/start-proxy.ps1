@@ -23,8 +23,8 @@ param(
 
     [string]$Udid = "",
 
-    # Cap bulk (>512KB) TCP streams in Mbps while VoIP/UDP (Discord) is active (0 = unlimited)
-    [double]$BulkCapMbps = 12,
+    # Cap bulk (>512KB) TCP streams in Mbps while VoIP/UDP (Discord) is active (240 = 30 MB/s, 0 = unlimited)
+    [double]$BulkCapMbps = 240,
 
     # Open usbmux SOCKS5 port (127.0.0.1:1080) without starting sing-box TUN (no Admin needed)
     [switch]$SocksOnly

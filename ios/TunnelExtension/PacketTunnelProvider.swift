@@ -20,7 +20,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let config = resolveConfig(options: options)
-        appendLog("starting dummy Packet Tunnel (port=\(config.listenPort), maxConn=\(config.maxConnections), buf=\(config.bufferSize / 1024)KB)")
+        appendLog("starting dummy Packet Tunnel (port=\(config.listenPort), maxConn=\(config.maxConnections), buf=\(config.bufferSize / 1024)KB, window=\(config.maxInFlightBytes / 1024)KB)")
 
         // Dummy tunnel settings: RFC 2544 address space, NO included routes, default route excluded,
         // and no DNS override so iOS traffic and outbound `.cellular` sockets bypass the dummy utun.
@@ -130,6 +130,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var cfg = raw
         cfg.maxConnections = min(max(1, cfg.maxConnections), ProxyConfig.tunnelExtension.maxConnections)
         cfg.bufferSize = min(max(4096, cfg.bufferSize), ProxyConfig.tunnelExtension.bufferSize)
+        cfg.maxInFlightBytes = min(max(cfg.bufferSize, cfg.maxInFlightBytes), ProxyConfig.tunnelExtension.maxInFlightBytes)
         cfg.maxUDPFlowsPerStream = min(max(4, cfg.maxUDPFlowsPerStream), ProxyConfig.tunnelExtension.maxUDPFlowsPerStream)
         cfg.tcpIdleTimeout = min(cfg.tcpIdleTimeout, ProxyConfig.tunnelExtension.tcpIdleTimeout)
         return cfg

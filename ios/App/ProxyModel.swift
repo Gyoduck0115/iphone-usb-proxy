@@ -272,6 +272,7 @@ final class ProxyModel: ObservableObject {
         // Enforce Stage 2 memory-safe caps inside the ~50 MB NEPacketTunnelProvider extension.
         extConfig.maxConnections = min(extConfig.maxConnections, ProxyConfig.tunnelExtension.maxConnections)
         extConfig.bufferSize = min(extConfig.bufferSize, ProxyConfig.tunnelExtension.bufferSize)
+        extConfig.maxInFlightBytes = min(extConfig.maxInFlightBytes, ProxyConfig.tunnelExtension.maxInFlightBytes)
         extConfig.maxUDPFlowsPerStream = min(extConfig.maxUDPFlowsPerStream, ProxyConfig.tunnelExtension.maxUDPFlowsPerStream)
 
         do {

@@ -15,9 +15,12 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
     public var maxConnections: Int
     /// Maximum number of concurrent outbound UDP flows per UoT non-connect stream.
     public var maxUDPFlowsPerStream: Int
-    /// Maximum read/write chunk size per direction; paired with strict 1-in-flight backpressure
-    /// so worst-case buffer memory stays bounded by `maxConnections * 2 * bufferSize`.
+    /// Maximum read/write chunk size per direction.
     public var bufferSize: Int
+    /// Maximum unacknowledged bytes in flight per direction (sliding-window pipelining).
+    /// Larger windows in app mode eliminate stop-and-wait stalls for 30+ MB/s 5G transfers;
+    /// smaller windows in extension mode keep worst-case memory well under the ~50 MB jetsam limit.
+    public var maxInFlightBytes: Int
     /// SOCKS5 handshake deadline in seconds.
     public var handshakeTimeout: TimeInterval
     /// Outbound TCP dial timeout in seconds.
@@ -41,7 +44,8 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
         enableUDP: Bool = true,
         maxConnections: Int = 256,
         maxUDPFlowsPerStream: Int = 64,
-        bufferSize: Int = 32 * 1024,
+        bufferSize: Int = 128 * 1024,
+        maxInFlightBytes: Int = 512 * 1024,
         handshakeTimeout: TimeInterval = 10,
         dialTimeout: TimeInterval = 15,
         tcpIdleTimeout: TimeInterval = 300,
@@ -57,6 +61,7 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
         self.maxConnections = maxConnections
         self.maxUDPFlowsPerStream = maxUDPFlowsPerStream
         self.bufferSize = bufferSize
+        self.maxInFlightBytes = maxInFlightBytes
         self.handshakeTimeout = handshakeTimeout
         self.dialTimeout = dialTimeout
         self.tcpIdleTimeout = tcpIdleTimeout
@@ -67,15 +72,54 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
         self.reaperInterval = reaperInterval
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case listenPort, requireCellular, enableUDP, maxConnections, maxUDPFlowsPerStream
+        case bufferSize, maxInFlightBytes, handshakeTimeout, dialTimeout, tcpIdleTimeout
+        case halfCloseTimeout, udpIdleTimeout, udpDNSIdleTimeout, tcpKeepaliveIdle, reaperInterval
+    }
+
+    /// Backward-compatible decoder: preserves saved user settings (e.g. `listenPort = 10808`)
+    /// from pre-pipelining builds lacking `maxInFlightBytes`, while upgrading legacy 16 KB
+    /// app defaults to the high-throughput 128 KB / 512 KB sliding-window defaults.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = ProxyConfig.appDefault
+        self.listenPort = try c.decodeIfPresent(UInt16.self, forKey: .listenPort) ?? d.listenPort
+        self.requireCellular = try c.decodeIfPresent(Bool.self, forKey: .requireCellular) ?? d.requireCellular
+        self.enableUDP = try c.decodeIfPresent(Bool.self, forKey: .enableUDP) ?? d.enableUDP
+        self.maxConnections = try c.decodeIfPresent(Int.self, forKey: .maxConnections) ?? d.maxConnections
+        self.maxUDPFlowsPerStream = try c.decodeIfPresent(Int.self, forKey: .maxUDPFlowsPerStream) ?? d.maxUDPFlowsPerStream
+
+        let decodedBuffer = try c.decodeIfPresent(Int.self, forKey: .bufferSize) ?? d.bufferSize
+        let decodedInFlight = try c.decodeIfPresent(Int.self, forKey: .maxInFlightBytes)
+        if let decodedInFlight {
+            self.bufferSize = decodedBuffer
+            self.maxInFlightBytes = decodedInFlight
+        } else {
+            self.bufferSize = decodedBuffer <= 32 * 1024 ? d.bufferSize : decodedBuffer
+            self.maxInFlightBytes = max(self.bufferSize, d.maxInFlightBytes)
+        }
+
+        self.handshakeTimeout = try c.decodeIfPresent(TimeInterval.self, forKey: .handshakeTimeout) ?? d.handshakeTimeout
+        self.dialTimeout = try c.decodeIfPresent(TimeInterval.self, forKey: .dialTimeout) ?? d.dialTimeout
+        self.tcpIdleTimeout = try c.decodeIfPresent(TimeInterval.self, forKey: .tcpIdleTimeout) ?? d.tcpIdleTimeout
+        self.halfCloseTimeout = try c.decodeIfPresent(TimeInterval.self, forKey: .halfCloseTimeout) ?? d.halfCloseTimeout
+        self.udpIdleTimeout = try c.decodeIfPresent(TimeInterval.self, forKey: .udpIdleTimeout) ?? d.udpIdleTimeout
+        self.udpDNSIdleTimeout = try c.decodeIfPresent(TimeInterval.self, forKey: .udpDNSIdleTimeout) ?? d.udpDNSIdleTimeout
+        self.tcpKeepaliveIdle = try c.decodeIfPresent(Int.self, forKey: .tcpKeepaliveIdle) ?? d.tcpKeepaliveIdle
+        self.reaperInterval = try c.decodeIfPresent(TimeInterval.self, forKey: .reaperInterval) ?? d.reaperInterval
+    }
+
     /// Standard configuration when running inside the main app process.
-    /// Uses 16 KB relay chunks to keep per-socket loopback/USB bufferbloat low so VoIP/UoT stays responsive.
+    /// Uses 128 KB chunks with 512 KB sliding-window pipelining to sustain 30+ MB/s on 5G + USB.
     public static let appDefault = ProxyConfig(
         listenPort: 1080,
         requireCellular: true,
         enableUDP: true,
         maxConnections: 512,
         maxUDPFlowsPerStream: 64,
-        bufferSize: 16 * 1024,
+        bufferSize: 128 * 1024,
+        maxInFlightBytes: 512 * 1024,
         handshakeTimeout: 10,
         dialTimeout: 15,
         tcpIdleTimeout: 120,
@@ -87,7 +131,7 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
     )
 
     /// Memory-constrained configuration for NEPacketTunnelProvider (~50 MB jetsam limit).
-    /// Worst-case relay buffer ceiling: 200 * 2 * 16 KB = 6.4 MB.
+    /// Worst-case relay window ceiling: 200 * 2 * 64 KB = 25.6 MB.
     public static let tunnelExtension = ProxyConfig(
         listenPort: 1080,
         requireCellular: true,
@@ -95,6 +139,7 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
         maxConnections: 200,
         maxUDPFlowsPerStream: 32,
         bufferSize: 16 * 1024,
+        maxInFlightBytes: 64 * 1024,
         handshakeTimeout: 8,
         dialTimeout: 15,
         tcpIdleTimeout: 180,
@@ -113,7 +158,8 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
             enableUDP: true,
             maxConnections: maxConnections,
             maxUDPFlowsPerStream: 32,
-            bufferSize: 16 * 1024,
+            bufferSize: 32 * 1024,
+            maxInFlightBytes: 128 * 1024,
             handshakeTimeout: 5,
             dialTimeout: 5,
             tcpIdleTimeout: 30,

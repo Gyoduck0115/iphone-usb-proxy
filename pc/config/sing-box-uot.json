@@ -71,15 +71,6 @@
       {
         "ip_is_private": true,
         "outbound": "direct"
-      },
-      {
-        "protocol": "quic",
-        "action": "reject"
-      },
-      {
-        "network": "udp",
-        "port": [443],
-        "action": "reject"
       }
     ],
     "final": "socks-out",

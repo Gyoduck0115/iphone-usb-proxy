@@ -76,4 +76,36 @@ final class TrafficAndPolicyTests: XCTestCase {
         XCTAssertTrue(exported.contains("USBProxy Test"))
         XCTAssertTrue(exported.contains("1.2.…"))
     }
+
+    func testLegacyProxyConfigDecodesAndUpgradesThroughputDefaults() throws {
+        // Legacy saved config without `maxInFlightBytes` and with old 16 KB bufferSize.
+        let legacyJSON = """
+        {
+            "listenPort": 10808,
+            "requireCellular": true,
+            "enableUDP": true,
+            "maxConnections": 512,
+            "maxUDPFlowsPerStream": 64,
+            "bufferSize": 16384,
+            "handshakeTimeout": 10,
+            "dialTimeout": 15,
+            "tcpIdleTimeout": 120,
+            "halfCloseTimeout": 10,
+            "udpIdleTimeout": 60,
+            "udpDNSIdleTimeout": 20,
+            "tcpKeepaliveIdle": 600,
+            "reaperInterval": 15
+        }
+        """
+        let decoded = try JSONDecoder().decode(ProxyConfig.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decoded.listenPort, 10808)
+        XCTAssertEqual(decoded.bufferSize, ProxyConfig.appDefault.bufferSize)
+        XCTAssertEqual(decoded.maxInFlightBytes, ProxyConfig.appDefault.maxInFlightBytes)
+
+        // Modern tunnelExtension config keeps its explicit 16 KB / 64 KB limits intact.
+        let encodedExt = try JSONEncoder().encode(ProxyConfig.tunnelExtension)
+        let decodedExt = try JSONDecoder().decode(ProxyConfig.self, from: encodedExt)
+        XCTAssertEqual(decodedExt.bufferSize, 16 * 1024)
+        XCTAssertEqual(decodedExt.maxInFlightBytes, 64 * 1024)
+    }
 }

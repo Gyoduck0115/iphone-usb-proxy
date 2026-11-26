@@ -102,7 +102,7 @@ static async Task<int> RunForwardAsync(string[] subArgs, CancellationToken ct)
     }
 
     string? udid = null;
-    double bulkCapMbps = 12.0; // Applied to bulk (>512KB) TCP streams ONLY while UoT/Voice traffic is active
+    double bulkCapMbps = 240.0; // 30 MB/s cap on bulk (>512KB) TCP streams while VoIP/UoT is active (0 = unlimited)
     for (int i = 2; i < subArgs.Length - 1; i++)
     {
         if (subArgs[i] == "--udid") udid = subArgs[i + 1];
@@ -188,10 +188,10 @@ static async Task HandleForwardedClientAsync(
 static void ConfigureSocket(TcpClient client)
 {
     client.NoDelay = true;
-    // Keep socket buffers modest (32 KB) so bulk downloads cannot fill megabytes of bufferbloat
-    // inside AppleMobileDeviceProcess's shared USB bulk pipe.
-    client.SendBufferSize = 32 * 1024;
-    client.ReceiveBufferSize = 32 * 1024;
+    // 256 KB socket buffers give enough BDP for 30+ MB/s single-stream 5G transfers
+    // while avoiding unbounded multi-megabyte loopback/USB bufferbloat.
+    client.SendBufferSize = 256 * 1024;
+    client.ReceiveBufferSize = 256 * 1024;
 }
 
 static async Task PumpWithQoSAsync(
@@ -203,15 +203,16 @@ static async Task PumpWithQoSAsync(
     QoSController qos,
     CancellationToken ct)
 {
-    const int NormalChunk = 16 * 1024;
-    const int BulkChunk = 8 * 1024;
-    byte[] buffer = new byte[NormalChunk];
+    const int FastChunk = 128 * 1024;
+    const int PacedBulkChunk = 32 * 1024;
+    byte[] buffer = new byte[FastChunk];
 
     try
     {
         while (true)
         {
-            int maxRead = state.IsBulk ? BulkChunk : NormalChunk;
+            bool shouldPace = state.IsBulk && qos.ShouldPaceNow();
+            int maxRead = shouldPace ? PacedBulkChunk : FastChunk;
             int n = await src.ReadAsync(buffer.AsMemory(0, maxRead), ct);
             if (n == 0) break;
 
@@ -591,6 +592,8 @@ sealed class QoSController
         long last = Volatile.Read(ref _lastVoiceActivityMs);
         return (Environment.TickCount64 - last) <= VoiceActiveWindowMs;
     }
+
+    public bool ShouldPaceNow() => _bulkBytesPerSec > 0 && IsVoiceActive();
 
     public async ValueTask PaceBulkAsync(int bytes, CancellationToken ct)
     {

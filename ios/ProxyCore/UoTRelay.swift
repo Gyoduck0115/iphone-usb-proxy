@@ -47,7 +47,7 @@ final class UoTRelaySession: @unchecked Sendable {
     private var lastActivityTouchUptime: TimeInterval = 0
 
     private static let maxPendingWriteFrames = 128
-    private static let maxReadBufferBytes = 256 * 1024
+    private static let maxReadBufferBytes = 512 * 1024
 
     init(
         version: UoTVersion,

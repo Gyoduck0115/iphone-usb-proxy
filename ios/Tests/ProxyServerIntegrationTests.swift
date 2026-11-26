@@ -122,6 +122,86 @@ final class ProxyServerIntegrationTests: XCTestCase {
         XCTAssertEqual(replyPayload, Data("udp-over-tcp".utf8))
     }
 
+    func testSOCKS5TCPPipelinedLargeTransfer() throws {
+        let echoPort = try startTCPEchoServer()
+        let proxy = ProxyServer(config: .testing(port: 0))
+        let readyExp = expectation(description: "proxy ready")
+        var proxyPort: UInt16 = 0
+        proxy.start { result in
+            if case .success(let p) = result { proxyPort = p }
+            readyExp.fulfill()
+        }
+        wait(for: [readyExp], timeout: 5)
+        defer { proxy.stop() }
+
+        let totalBytes = 1024 * 1024 // 1 MB (8x the 128 KB sliding window)
+        var payload = Data(count: totalBytes)
+        payload.withUnsafeMutableBytes { raw in
+            let ptr = raw.bindMemory(to: UInt8.self)
+            for i in 0..<totalBytes {
+                ptr[i] = UInt8(truncatingIfNeeded: (i &* 31) ^ (i >> 8))
+            }
+        }
+
+        let conn = NWConnection(
+            to: .hostPort(host: .ipv4(.loopback), port: NWEndpoint.Port(rawValue: proxyPort)!),
+            using: .tcp
+        )
+        let queue = DispatchQueue(label: "test.socks5.pipelined")
+        let done = expectation(description: "1MB pipelined echo complete")
+        var received = Data()
+        received.reserveCapacity(totalBytes)
+        var fulfilled = false
+
+        func readLoop() {
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+                if let data, !data.isEmpty {
+                    received.append(data)
+                }
+                if isComplete || error != nil {
+                    if !fulfilled {
+                        fulfilled = true
+                        done.fulfill()
+                    }
+                    return
+                }
+                readLoop()
+            }
+        }
+
+        conn.stateUpdateHandler = { state in
+            guard case .ready = state else { return }
+            conn.send(content: Data([0x05, 0x01, 0x00]), completion: .contentProcessed { _ in
+                conn.receive(minimumIncompleteLength: 2, maximumLength: 2) { data, _, _, _ in
+                    XCTAssertEqual(data, Data([0x05, 0x00]))
+                    let req = Data([
+                        0x05, 0x01, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        UInt8(echoPort >> 8), UInt8(echoPort & 0xff)
+                    ])
+                    conn.send(content: req, completion: .contentProcessed { _ in
+                        conn.receive(minimumIncompleteLength: 10, maximumLength: 10) { rep, _, _, _ in
+                            XCTAssertEqual(rep?.prefix(2), Data([0x05, 0x00]))
+                            readLoop()
+                            conn.send(content: payload, completion: .contentProcessed { _ in
+                                conn.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in })
+                            })
+                        }
+                    })
+                }
+            })
+        }
+        conn.start(queue: queue)
+        wait(for: [done], timeout: 15)
+        conn.cancel()
+
+        XCTAssertEqual(received.count, totalBytes)
+        XCTAssertEqual(received, payload)
+        let snap = proxy.snapshot()
+        XCTAssertGreaterThanOrEqual(snap.traffic.bytesUp, UInt64(totalBytes))
+        XCTAssertGreaterThanOrEqual(snap.traffic.bytesDown, UInt64(totalBytes))
+    }
+
     // MARK: - Local Echo Helpers
 
     private func startTCPEchoServer() throws -> UInt16 {
@@ -140,13 +220,21 @@ final class ProxyServerIntegrationTests: XCTestCase {
         listener.newConnectionHandler = { conn in
             conn.start(queue: queue)
             func loop() {
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, isComplete, error in
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
                     if let data, !data.isEmpty {
                         conn.send(content: data, completion: .contentProcessed { _ in
-                            if !isComplete && error == nil { loop() } else { conn.cancel() }
+                            if !isComplete && error == nil {
+                                loop()
+                            } else {
+                                conn.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
+                                    conn.cancel()
+                                })
+                            }
                         })
                     } else {
-                        conn.cancel()
+                        conn.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
+                            conn.cancel()
+                        })
                     }
                 }
             }

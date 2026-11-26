@@ -7,7 +7,7 @@ import Network
 /// Key properties (from the plan & `viktor-svirsky/tether`):
 /// - Listens ONLY on `127.0.0.1:<port>` (no Local Network permission required; reached via usbmux/`iproxy`).
 /// - Pins outbound TCP/UDP connections to `.cellular` (`requiredInterfaceType = .cellular`) so Wi-Fi can stay on.
-/// - Bounds memory per connection with strict 1-in-flight backpressure, concurrency limits, and idle reaping.
+/// - Bounds memory per connection with sliding-window backpressure (`maxInFlightBytes`), concurrency limits, and idle reaping.
 /// - Automatically reopens its listener with exponential backoff if iOS closes sockets during suspension/calls.
 public final class ProxyServer: @unchecked Sendable {
     public private(set) var config: ProxyConfig
@@ -686,90 +686,130 @@ private final class ClientSession: @unchecked Sendable {
         })
     }
 
-    // MARK: - Bidirectional TCP Relay with Backpressure & Half-Close
+    // MARK: - Bidirectional TCP Relay with Sliding-Window Pipelining & Half-Close
+
+    private final class DirectionState {
+        var inFlightBytes = 0
+        var readPaused = false
+        var finished = false
+        var pendingTrafficBytes: UInt64 = 0
+        var hasFlushedTraffic = false
+    }
 
     private func startTCPRelayLocked(outbound: NWConnection) {
         let initialClientData = handshakeBuffer
         handshakeBuffer.removeAll(keepingCapacity: false)
 
+        let downState = DirectionState()
+        let upState = DirectionState()
+
         // Remote -> Client direction starts immediately.
-        pump(from: outbound, to: client, isUpload: false)
+        pump(from: outbound, to: client, isUpload: false, state: downState)
 
         // Client -> Remote: flush any pipelined bytes received during handshake first.
         if !initialClientData.isEmpty {
             onTraffic(UInt64(initialClientData.count), 0)
+            upState.hasFlushedTraffic = true
             outbound.send(content: initialClientData, completion: .contentProcessed { [weak self] error in
                 guard let self, self.phase == .relayingTCP else { return }
                 if error != nil {
                     self.closeLocked()
                     return
                 }
-                self.pump(from: self.client, to: outbound, isUpload: true)
+                self.pump(from: self.client, to: outbound, isUpload: true, state: upState)
             })
         } else {
-            pump(from: client, to: outbound, isUpload: true)
+            pump(from: client, to: outbound, isUpload: true, state: upState)
         }
     }
 
-    private func pump(from source: NWConnection, to destination: NWConnection, isUpload: Bool) {
-        guard phase == .relayingTCP else { return }
+    private func pump(
+        from source: NWConnection,
+        to destination: NWConnection,
+        isUpload: Bool,
+        state: DirectionState
+    ) {
+        guard phase == .relayingTCP, !state.finished else { return }
+        let maxInFlight = max(config.bufferSize, config.maxInFlightBytes)
+        if state.inFlightBytes >= maxInFlight {
+            state.readPaused = true
+            return
+        }
+        state.readPaused = false
+
         source.receive(minimumIncompleteLength: 1, maximumLength: config.bufferSize) { [weak self] content, _, isComplete, error in
-            guard let self, self.phase == .relayingTCP else { return }
+            guard let self, self.phase == .relayingTCP, !state.finished else { return }
 
             if let data = content, !data.isEmpty {
+                let count = data.count
                 self.touchThrottledLocked()
-                if isUpload {
-                    self.onTraffic(UInt64(data.count), 0)
-                } else {
-                    self.onTraffic(0, UInt64(data.count))
+                state.pendingTrafficBytes &+= UInt64(count)
+                if !state.hasFlushedTraffic || state.pendingTrafficBytes >= 64 * 1024 {
+                    let flush = state.pendingTrafficBytes
+                    state.pendingTrafficBytes = 0
+                    state.hasFlushedTraffic = true
+                    if isUpload {
+                        self.onTraffic(flush, 0)
+                    } else {
+                        self.onTraffic(0, flush)
+                    }
                 }
+
+                state.inFlightBytes += count
                 destination.send(content: data, completion: .contentProcessed { [weak self] sendError in
                     guard let self, self.phase == .relayingTCP else { return }
+                    state.inFlightBytes = max(0, state.inFlightBytes - count)
                     if sendError != nil {
                         self.closeLocked()
                         return
                     }
-                    if isComplete || error != nil {
-                        self.handleDirectionEOF(destination: destination, isUpload: isUpload)
-                    } else {
-                        self.pump(from: source, to: destination, isUpload: isUpload)
+                    if state.readPaused && !state.finished && state.inFlightBytes <= maxInFlight / 2 {
+                        self.pump(from: source, to: destination, isUpload: isUpload, state: state)
                     }
                 })
-                return
             }
 
             if isComplete || error != nil {
+                state.finished = true
+                if state.pendingTrafficBytes > 0 {
+                    let flush = state.pendingTrafficBytes
+                    state.pendingTrafficBytes = 0
+                    if isUpload {
+                        self.onTraffic(flush, 0)
+                    } else {
+                        self.onTraffic(0, flush)
+                    }
+                }
                 self.handleDirectionEOF(destination: destination, isUpload: isUpload)
+                return
+            }
+
+            if state.inFlightBytes < maxInFlight {
+                self.pump(from: source, to: destination, isUpload: isUpload, state: state)
             } else {
-                self.pump(from: source, to: destination, isUpload: isUpload)
+                state.readPaused = true
             }
         }
     }
 
     private func handleDirectionEOF(destination: NWConnection, isUpload: Bool) {
-        if isUpload {
-            clientEOF = true
-        } else {
-            remoteEOF = true
-        }
-
-        // Propagate TCP FIN to the opposite side.
+        // Propagate TCP FIN in FIFO order after all prior in-flight sends complete.
         destination.send(
             content: nil,
             contentContext: .finalMessage,
             isComplete: true,
             completion: .contentProcessed { [weak self] _ in
-                guard let self else { return }
+                guard let self, self.phase == .relayingTCP else { return }
+                if isUpload {
+                    self.clientEOF = true
+                } else {
+                    self.remoteEOF = true
+                }
                 if self.clientEOF && self.remoteEOF {
                     self.closeLocked()
                 }
             }
         )
-
-        if clientEOF && remoteEOF {
-            closeLocked()
-            return
-        }
 
         // Guard against peers that never close their half after receiving FIN.
         if halfCloseTimer == nil {
