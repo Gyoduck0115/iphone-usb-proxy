@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
     iPhone USB Proxy launcher (Stage 3):
-    Detects USB iPhone -> starts usbmux forwarder -> verifies SOCKS5 handshake -> runs sing-box TUN -> restores routes on exit.
+    Detects USB iPhone -> auto-detects active USBProxy SOCKS5 port -> starts usbmux forwarder -> runs sing-box TUN -> restores routes on exit.
 .EXAMPLE
+    .\pc\scripts\start-proxy.ps1
     .\pc\scripts\start-proxy.ps1 -Mode uot -DevicePort 10808
-    .\pc\scripts\start-proxy.ps1 -Mode tcp -DevicePort 10808
-    .\pc\scripts\start-proxy.ps1 -SocksOnly -DevicePort 10808
+    .\pc\scripts\start-proxy.ps1 -Mode tcp
+    .\pc\scripts\start-proxy.ps1 -SocksOnly
 #>
 [CmdletBinding()]
 param(
@@ -13,7 +14,9 @@ param(
     [string]$Mode = "uot",
 
     [int]$LocalPort = 1080,
-    [int]$DevicePort = 1080,
+
+    # 0 = auto-detect active USBProxy SOCKS5 port on iPhone (checks 1080, 10808, 18080, 21080)
+    [int]$DevicePort = 0,
 
     [ValidateSet("auto", "iproxy", "pymobiledevice3", "bridge")]
     [string]$Forwarder = "auto",
@@ -51,6 +54,78 @@ function Test-PortOpen([string]$TargetHost, [int]$Port) {
     } finally {
         $tcp.Dispose()
     }
+}
+
+function Ensure-LocalPortFree([int]$Port) {
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($c in $listeners) {
+        $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+        if ($proc -and ($proc.ProcessName -in @("UsbMuxBridge", "iproxy"))) {
+            Write-Host "  Stopping stale $($proc.ProcessName) (PID=$($proc.Id)) holding 127.0.0.1:$Port..." -ForegroundColor Yellow
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 300
+        } else {
+            $pname = if ($proc) { $proc.ProcessName } else { "unknown" }
+            throw "Local port 127.0.0.1:$Port is already in use by '$pname' (PID=$($c.OwningProcess)). Stop it or pass -LocalPort."
+        }
+    }
+}
+
+function Find-DeviceSocks5Port([int]$DeviceId, [int[]]$CandidatePorts) {
+    if (-not ("UsbMuxSocksProbe" -as [type])) {
+        $probeCode = @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+public static class UsbMuxSocksProbe {
+    public static bool IsSocks5Ready(int deviceId, ushort port) {
+        try {
+            using (var tcp = new TcpClient()) {
+                tcp.Connect(IPAddress.Loopback, 27015);
+                tcp.ReceiveTimeout = 2000;
+                tcp.SendTimeout = 2000;
+                var s = tcp.GetStream();
+                ushort swapped = (ushort)(((port & 0xff) << 8) | (port >> 8));
+                string xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>BundleID</key><string>com.local.usbproxy</string><key>ClientVersionString</key><string>1.0</string><key>DeviceID</key><integer>" + deviceId + "</integer><key>MessageType</key><string>Connect</string><key>PortNumber</key><integer>" + swapped + "</integer><key>ProgName</key><string>start-proxy</string></dict></plist>";
+                byte[] payload = Encoding.UTF8.GetBytes(xml);
+                byte[] hdr = new byte[16];
+                BitConverter.GetBytes((uint)(16 + payload.Length)).CopyTo(hdr, 0);
+                BitConverter.GetBytes((uint)1).CopyTo(hdr, 4);
+                BitConverter.GetBytes((uint)8).CopyTo(hdr, 8);
+                BitConverter.GetBytes((uint)1).CopyTo(hdr, 12);
+                s.Write(hdr, 0, 16);
+                s.Write(payload, 0, payload.Length);
+
+                byte[] rhdr = new byte[16];
+                int off = 0; while (off < 16) { int n = s.Read(rhdr, off, 16 - off); if (n == 0) return false; off += n; }
+                uint len = BitConverter.ToUInt32(rhdr, 0);
+                if (len < 16 || len > 1048576) return false;
+                byte[] rbody = new byte[len - 16];
+                off = 0; while (off < rbody.Length) { int n = s.Read(rbody, off, rbody.Length - off); if (n == 0) return false; off += n; }
+                string reply = Encoding.UTF8.GetString(rbody);
+                if (!reply.Contains("<integer>0</integer>")) return false;
+
+                s.Write(new byte[] { 0x05, 0x01, 0x00 }, 0, 3);
+                byte[] g = new byte[2];
+                int gn = s.Read(g, 0, 2);
+                return (gn == 2 && g[0] == 0x05 && g[1] == 0x00);
+            }
+        } catch {
+            return false;
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $probeCode
+    }
+    foreach ($p in $CandidatePorts) {
+        if ([UsbMuxSocksProbe]::IsSocks5Ready($DeviceId, [uint16]$p)) {
+            return $p
+        }
+    }
+    return 0
 }
 
 function Test-Socks5Handshake([string]$TargetHost, [int]$Port) {
@@ -126,6 +201,7 @@ if (-not $muxListen) {
     throw "Apple Mobile Device Service (127.0.0.1:27015) is not listening. Check Apple Devices or iTunes."
 }
 
+$targetDeviceId = 0
 if (Test-Path $BridgeExe) {
     Write-Host "[1/4] Detecting USB-connected iPhone..." -ForegroundColor Cyan
     $devJson = & $BridgeExe devices --json
@@ -134,10 +210,35 @@ if (Test-Path $BridgeExe) {
     if ($usbDevices.Count -eq 0) {
         throw "No USB iPhone detected. Check your data cable, unlock the iPhone, and tap 'Trust This Computer'."
     }
-    foreach ($d in $usbDevices) {
-        Write-Host "  Detected: DeviceID=$($d.DeviceId), Serial=$($d.SerialNumber)" -ForegroundColor Green
+    $selected = if ($Udid) {
+        $usbDevices | Where-Object { $_.SerialNumber -eq $Udid } | Select-Object -First 1
+    } else {
+        $usbDevices | Select-Object -First 1
+    }
+    if (-not $selected) {
+        throw "No USB iPhone matching UDID '$Udid' was found."
+    }
+    $targetDeviceId = [int]$selected.DeviceId
+    Write-Host "  Detected: DeviceID=$($selected.DeviceId), Serial=$($selected.SerialNumber)" -ForegroundColor Green
+}
+
+# Auto-detect active USBProxy SOCKS5 port if -DevicePort was not specified
+if ($DevicePort -le 0) {
+    if ($targetDeviceId -gt 0) {
+        $detectedPort = Find-DeviceSocks5Port -DeviceId $targetDeviceId -CandidatePorts @(1080, 10808, 18080, 21080)
+        if ($detectedPort -gt 0) {
+            $DevicePort = $detectedPort
+            Write-Host "  Auto-detected active USBProxy SOCKS5 on iPhone:$DevicePort" -ForegroundColor Green
+        } else {
+            throw "USBProxy SOCKS5 did not answer on iPhone ports 1080, 10808, 18080, or 21080. Start USBProxy on the iPhone first (or pass -DevicePort explicitly)."
+        }
+    } else {
+        $DevicePort = 1080
     }
 }
+
+# Clean up stale UsbMuxBridge/iproxy holding LocalPort before starting a new forwarder
+Ensure-LocalPortFree -Port $LocalPort
 
 # 3. Capture pre-start default routes
 $beforeRoutes = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
@@ -184,14 +285,14 @@ try {
         if ($SocksOnly) {
             Write-Warning "iPhone SOCKS5 handshake check failed: $($probe.Reason)"
         } else {
-            throw "iPhone USBProxy SOCKS5 check failed: $($probe.Reason)`n-> Confirm USBProxy is listening on iPhone:$DevicePort. If port 1080 conflicts, switch to 10808 in the iPhone app and run with -DevicePort 10808."
+            throw "iPhone USBProxy SOCKS5 check failed: $($probe.Reason)`n-> Confirm USBProxy is listening on iPhone:$DevicePort. If port 1080 conflicts, switch to 10808 in the iPhone app."
         }
     } else {
         Write-Host "  [OK] iPhone USBProxy SOCKS5 handshake succeeded (iPhone:$DevicePort)" -ForegroundColor Green
     }
 
     if ($SocksOnly) {
-        Write-Host "`n[SOCKS5-only mode active] 127.0.0.1:$LocalPort (press Ctrl+C to stop)" -ForegroundColor Yellow
+        Write-Host "`n[SOCKS5-only mode active] 127.0.0.1:$LocalPort -> iPhone:$DevicePort (press Ctrl+C to stop)" -ForegroundColor Yellow
         Write-Host "  Test command: curl.exe --socks5-hostname 127.0.0.1:$LocalPort https://ifconfig.me"
         while (-not $fwdProc.HasExited) {
             Start-Sleep -Milliseconds 500
