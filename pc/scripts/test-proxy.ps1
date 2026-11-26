@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     0~3단계 동작 검증 스크립트:
     - SOCKS5 단독 출구 IP 확인 (curl --socks5-hostname)

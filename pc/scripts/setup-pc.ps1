@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     0단계 PC 준비 스크립트: Apple Devices/iTunes(usbmuxd), sing-box, UsbMuxBridge 설치 및 설정 검증.
 .EXAMPLE
