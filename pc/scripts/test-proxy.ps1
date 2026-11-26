@@ -1,13 +1,13 @@
-﻿<#
+<#
 .SYNOPSIS
-    0~3단계 동작 검증 스크립트:
-    - SOCKS5 단독 출구 IP 확인 (curl --socks5-hostname)
-    - TUN 모드 직통 출구 IP 확인
-    - UsbMuxBridge 내장 SOCKS5 + UoT v1/v2 셀프테스트
+    Stage 0-3 verification script:
+    - SelfTest: UsbMuxBridge usbmuxd + SOCKS5 TCP + UoT v1/v2 loopback test
+    - CheckSocks: verifies exit IP through 127.0.0.1:1080 SOCKS5
+    - CheckTun: verifies exit IP through active USBProxyTUN adapter
 .EXAMPLE
+    .\pc\scripts\test-proxy.ps1 -SelfTest
     .\pc\scripts\test-proxy.ps1 -CheckSocks
     .\pc\scripts\test-proxy.ps1 -CheckTun
-    .\pc\scripts\test-proxy.ps1 -SelfTest
 #>
 [CmdletBinding()]
 param(
@@ -27,30 +27,30 @@ if (-not $CheckSocks -and -not $CheckTun -and -not $SelfTest) {
 
 if ($SelfTest) {
     if (-not (Test-Path $BridgeExe)) {
-        throw "UsbMuxBridge.exe가 없습니다. 먼저 .\pc\scripts\setup-pc.ps1을 실행하세요."
+        throw "UsbMuxBridge.exe not found. Run .\pc\scripts\setup-pc.ps1 first."
     }
-    Write-Host "=== UsbMuxBridge 프로토콜 및 usbmuxd 셀프테스트 ===" -ForegroundColor Cyan
+    Write-Host "=== UsbMuxBridge protocol and usbmuxd selftest ===" -ForegroundColor Cyan
     & $BridgeExe selftest
-    if ($LASTEXITCODE -ne 0) { throw "selftest 실패" }
+    if ($LASTEXITCODE -ne 0) { throw "selftest failed" }
 }
 
 if ($CheckSocks) {
-    Write-Host "`n=== SOCKS5(127.0.0.1:$Port) 출구 IP 확인 ===" -ForegroundColor Cyan
+    Write-Host "`n=== Checking exit IP via SOCKS5 (127.0.0.1:$Port) ===" -ForegroundColor Cyan
     $ip = & curl.exe --silent --show-error --max-time 10 --socks5-hostname "127.0.0.1:$Port" "https://ifconfig.me"
-    if ($LASTEXITCODE -ne 0) { throw "SOCKS5 curl 요청 실패" }
-    Write-Host "  출구 IP: $ip" -ForegroundColor Green
-    Write-Host "  (아이폰 Wi-Fi가 켜져 있어도 셀룰러 통신사 IP가 나와야 1단계 완료 기준 통과입니다.)"
+    if ($LASTEXITCODE -ne 0) { throw "SOCKS5 curl failed" }
+    Write-Host "  Exit IP: $ip" -ForegroundColor Green
+    Write-Host "  (Should match your cellular carrier IP even when iPhone Wi-Fi is on.)"
 }
 
 if ($CheckTun) {
-    Write-Host "`n=== TUN 모드 전체 트래픽 출구 IP 확인 ===" -ForegroundColor Cyan
+    Write-Host "`n=== Checking exit IP via TUN mode ===" -ForegroundColor Cyan
     $tun = Get-NetAdapter -Name "USBProxyTUN" -ErrorAction SilentlyContinue
     if (-not $tun) {
-        Write-Warning "USBProxyTUN 어댑터가 보이지 않습니다. start-proxy.ps1이 실행 중인지 확인하세요."
+        Write-Warning "USBProxyTUN adapter not found. Ensure start-proxy.ps1 is running."
     } else {
-        Write-Host "  어댑터 상태: $($tun.Name) ($($tun.Status))" -ForegroundColor Green
+        Write-Host "  Adapter: $($tun.Name) ($($tun.Status))" -ForegroundColor Green
     }
     $ip = & curl.exe --silent --show-error --max-time 10 "https://ifconfig.me"
-    if ($LASTEXITCODE -ne 0) { throw "TUN 모드 curl 요청 실패" }
-    Write-Host "  출구 IP: $ip" -ForegroundColor Green
+    if ($LASTEXITCODE -ne 0) { throw "TUN curl failed" }
+    Write-Host "  Exit IP: $ip" -ForegroundColor Green
 }
