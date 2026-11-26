@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+out/
+pc/bin/
+pc/tools/UsbMuxBridge/bin/
+pc/tools/UsbMuxBridge/obj/
+*.ipa
+*.xcarchive
+*.log

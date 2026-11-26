@@ -1,0 +1,88 @@
+# Runs on GitHub's macOS runner so Windows-only users can test ProxyCore and download unsigned IPAs
+# for SideStore / AltStore / Feather without owning a Mac (plan section 5 & tether CI pattern).
+name: Build & Test iOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string (X.Y.Z) embedded into the unsigned IPA"
+        default: "1.0.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen (fast release zip, tether pattern)
+        env:
+          VERSION: "2.46.0"
+          SHA256: "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+        run: |
+          zip="$RUNNER_TEMP/xcodegen.zip"
+          curl -fsSL --retry 3 --retry-all-errors -o "$zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/$VERSION/xcodegen.zip"
+          echo "$SHA256  $zip" | shasum -a 256 -c -
+          unzip -qo "$zip" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" --version
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Run ProxyCore unit & loopback integration tests
+        run: swift test
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Compile-check USBProxy (with Packet Tunnel extension) for iOS Simulator
+        run: |
+          mkdir -p out
+          if ! xcodebuild -project USBProxy.xcodeproj -scheme USBProxy \
+              -destination 'generic/platform=iOS Simulator' \
+              CODE_SIGNING_ALLOWED=NO build > out/xcodebuild-sim.log 2>&1; then
+              awk '/(^| )error: / && n++ < 30' out/xcodebuild-sim.log >&2
+              tail -30 out/xcodebuild-sim.log >&2
+              exit 1
+          fi
+          tail -5 out/xcodebuild-sim.log
+
+      - name: Build unsigned USBProxyFree.ipa (free Apple ID / SideStore)
+        run: |
+          chmod +x scripts/build-ipa.sh
+          scripts/build-ipa.sh "${{ inputs.version || '1.0.0' }}" out --scheme USBProxyFree
+
+      - name: Build unsigned USBProxy.ipa (paid Apple Developer account + Packet Tunnel)
+        run: |
+          scripts/build-ipa.sh "${{ inputs.version || '1.0.0' }}" out --scheme USBProxy
+
+      - name: Upload unsigned IPA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: usbproxy-ipas
+          path: |
+            out/USBProxyFree.ipa
+            out/USBProxy.ipa
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-logs
+          path: out/xcodebuild-*.log
+          if-no-files-found: ignore
+          retention-days: 7
