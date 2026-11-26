@@ -204,11 +204,17 @@ public final class ProxyServer: @unchecked Sendable {
                     finish(.success(boundPort))
 
                 case .failed(let error):
+                    let message: String
+                    if case .posix(.EADDRINUSE) = error {
+                        message = "포트 \(self.config.listenPort)이(가) 이미 사용 중입니다 (EADDRINUSE). 다른 VPN/프록시 앱을 종료하거나 대기 포트를 10808 등으로 변경하세요."
+                    } else {
+                        message = "listener failed: \(error)"
+                    }
                     self.statsLock.lock()
                     self.isListening = false
-                    self.lastError = "listener failed: \(error)"
+                    self.lastError = message
                     self.statsLock.unlock()
-                    self.logHandler("listener failed: \(error)")
+                    self.logHandler("listener failed on 127.0.0.1:\(self.config.listenPort): \(error)")
                     self.notifyStateChanged()
                     finish(.failure(error))
                     if self.shouldRun {

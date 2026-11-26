@@ -1,4 +1,4 @@
-﻿<#
+﻿#
 .SYNOPSIS
     아이폰 USB 프록시 통합 실행 스크립트 (3단계 완성판).
     아이폰 USB 연결 감지 -> usbmux 포워딩 시작 -> sing-box TUN 시작 -> 종료 시 프로세스 정리 및 경로 원복.
@@ -48,6 +48,35 @@ function Test-PortOpen([string]$TargetHost, [int]$Port) {
         return $false
     } catch {
         return $false
+    } finally {
+        $tcp.Dispose()
+    }
+}
+
+function Test-Socks5Handshake([string]$TargetHost, [int]$Port) {
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $tcp.ReceiveTimeout = 2500
+        $tcp.SendTimeout = 2500
+        $ar = $tcp.BeginConnect($TargetHost, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne(1500)) {
+            return @{ Ok = $false; Reason = "로컬 포트 $Port 연결 시간 초과" }
+        }
+        $tcp.EndConnect($ar)
+        $stream = $tcp.GetStream()
+        [byte[]]$greeting = @(0x05, 0x01, 0x00)
+        $stream.Write($greeting, 0, $greeting.Length)
+        $buf = New-Object byte[] 2
+        $read = $stream.Read($buf, 0, 2)
+        if ($read -eq 2 -and $buf[0] -eq 0x05 -and $buf[1] -eq 0x00) {
+            return @{ Ok = $true; Reason = "OK" }
+        }
+        if ($read -eq 0) {
+            return @{ Ok = $false; Reason = "아이폰 포트 $DevicePort 연결이 즉시 닫혔습니다 (USBProxy가 중지되었거나 다른 앱이 포트 $DevicePort 을(를) 점유 중)" }
+        }
+        return @{ Ok = $false; Reason = "아이폰 포트 $DevicePort 응답이 SOCKS5가 아닙니다 (수신: $($buf[0]), $($buf[1]))" }
+    } catch {
+        return @{ Ok = $false; Reason = $_.Exception.Message }
     } finally {
         $tcp.Dispose()
     }
@@ -149,6 +178,18 @@ try {
         throw "127.0.0.1:$LocalPort 포트가 열리지 않았습니다."
     }
     Write-Host "  usbmux 포트 준비 완료 (PID=$($fwdProc.Id))" -ForegroundColor Green
+
+    # TUN 어댑터로 PC 기본 경로를 넘기기 전에 아이폰 USBProxy SOCKS5 응답을 먼저 검증
+    $probe = Test-Socks5Handshake -TargetHost "127.0.0.1" -Port $LocalPort
+    if (-not $probe.Ok) {
+        if ($SocksOnly) {
+            Write-Warning "아이폰 SOCKS5 응답 확인 실패: $($probe.Reason)"
+        } else {
+            throw "아이폰 USBProxy SOCKS5 응답 확인 실패: $($probe.Reason)`n-> 아이폰 USBProxy 앱에서 '대기 및 중계 중' 상태인지 확인하고, 포트 충돌 시 앱에서 포트를 10808로 바꾼 뒤 '-DevicePort 10808'로 다시 실행하세요."
+        }
+    } else {
+        Write-Host "  [OK] 아이폰 USBProxy SOCKS5 핸드셰이크 정상 응답 확인 (iPhone:$DevicePort)" -ForegroundColor Green
+    }
 
     if ($SocksOnly) {
         Write-Host "`n[SOCKS5 전용 모드 실행 중] 127.0.0.1:$LocalPort (Ctrl+C로 종료)" -ForegroundColor Yellow

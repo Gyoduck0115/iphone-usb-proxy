@@ -23,6 +23,9 @@ final class ProxyModel: ObservableObject {
     @Published var config: ProxyConfig {
         didSet {
             store.saveConfig(config)
+            if !isRunning {
+                snapshot.listenPort = config.listenPort
+            }
         }
     }
 
@@ -93,6 +96,7 @@ final class ProxyModel: ObservableObject {
         }
         self.runMode = initialMode
         self.config = store.loadConfig(default: .appDefault)
+        self.snapshot.listenPort = self.config.listenPort
         self.preventScreenSleep = store.preventScreenSleep
         self.keepAliveAudioEnabled = store.keepAliveAudioEnabled
         self.idleStopTimeout = store.idleStopTimeout
@@ -183,6 +187,21 @@ final class ProxyModel: ObservableObject {
         }
     }
 
+    func switchPortAndRestart(to newPort: UInt16) async {
+        stopProxy()
+        config.listenPort = newPort
+        snapshot.listenPort = newPort
+        snapshot.lastError = nil
+        errorMessage = nil
+        try? await Task.sleep(for: .milliseconds(250))
+        await startProxy()
+    }
+
+    var hasAddressInUseError: Bool {
+        let combined = (errorMessage ?? "") + " " + (snapshot.lastError ?? "")
+        return combined.contains("EADDRINUSE") || combined.contains("Address already in use") || combined.contains("rawValue: 48")
+    }
+
     func resetCounters() async {
         sampler.reset()
         upSpeedBps = 0
@@ -222,7 +241,8 @@ final class ProxyModel: ObservableObject {
                     self.errorMessage = nil
                     self.appendLog("in-app proxy ready on 127.0.0.1:\(port)")
                 case .failure(let error):
-                    self.errorMessage = "리스너 시작 실패: \(error.localizedDescription)"
+                    let snap = server.snapshot()
+                    self.errorMessage = snap.lastError ?? "리스너 시작 실패: \(error.localizedDescription)"
                     self.appendLog("in-app proxy start failed: \(error)")
                 }
                 self.snapshot = server.snapshot()

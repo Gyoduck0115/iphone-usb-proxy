@@ -58,13 +58,28 @@ struct MainView: View {
                 // Error banner
                 if let err = model.errorMessage ?? model.snapshot.lastError {
                     Section {
-                        Label {
-                            Text(err)
-                                .font(.subheadline)
-                        } icon: {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .foregroundStyle(.red)
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label {
+                                Text(err)
+                                    .font(.subheadline)
+                            } icon: {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .foregroundStyle(.red)
+                            }
+                            if model.hasAddressInUseError {
+                                let fallbackPort: UInt16 = model.config.listenPort == 10808 ? 18080 : 10808
+                                Button {
+                                    Task { await model.switchPortAndRestart(to: fallbackPort) }
+                                } label: {
+                                    Label("포트 \(String(fallbackPort))으로 변경 후 다시 시작", systemImage: "arrow.triangle.2.circlepath")
+                                        .font(.subheadline.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.orange)
+                            }
                         }
+                        .padding(.vertical, 2)
                     }
                 }
 
@@ -106,13 +121,25 @@ struct MainView: View {
 
                 // Run Mode & Options
                 Section("실행 모드 및 설정") {
-                    Picker("백그라운드 방식", selection: $model.runMode) {
-                        ForEach(ProxyRunMode.allCases, id: \.self) { mode in
-                            Text(mode == .inApp ? "앱 내 (무음 오디오)" : "Packet Tunnel (VPN)")
-                                .tag(mode)
-                        }
+                    Picker("대기 포트 (127.0.0.1)", selection: $model.config.listenPort) {
+                        Text("1080 (기본)").tag(UInt16(1080))
+                        Text("10808 (충돌 회피)").tag(UInt16(10808))
+                        Text("18080").tag(UInt16(18080))
+                        Text("21080").tag(UInt16(21080))
                     }
-                    .pickerStyle(.segmented)
+                    .disabled(model.isRunning)
+
+                    if VPNTunnelController.isSupportedInBuild {
+                        Picker("백그라운드 방식", selection: $model.runMode) {
+                            ForEach(ProxyRunMode.allCases, id: \.self) { mode in
+                                Text(mode == .inApp ? "앱 내 (무음 오디오)" : "Packet Tunnel (VPN)")
+                                    .tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    } else {
+                        LabeledContent("백그라운드 방식", value: "앱 내 (무음 오디오)")
+                    }
 
                     Text(model.runMode.subtitle)
                         .font(.footnote)
@@ -137,11 +164,15 @@ struct MainView: View {
                 }
 
                 Section("PC 연결 명령 (Windows)") {
+                    let port = model.snapshot.listenPort
+                    let startCmd = port == 1080
+                        ? ".\\pc\\scripts\\start-proxy.ps1 -Mode uot"
+                        : ".\\pc\\scripts\\start-proxy.ps1 -Mode uot -DevicePort \(port)"
                     VStack(alignment: .leading, spacing: 6) {
                         Text("1. USB 포트 포워딩 + sing-box 실행")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
-                        Text(".\\pc\\scripts\\start-proxy.ps1 -Mode uot")
+                        Text(startCmd)
                             .font(.caption.monospaced())
                             .textSelection(.enabled)
 
@@ -149,7 +180,7 @@ struct MainView: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .padding(.top, 4)
-                        Text("curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me")
+                        Text("curl.exe --socks5-hostname 127.0.0.1:1080 https://ifconfig.me")
                             .font(.caption.monospaced())
                             .textSelection(.enabled)
                     }
