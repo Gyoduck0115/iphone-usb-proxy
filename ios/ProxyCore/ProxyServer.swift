@@ -13,6 +13,11 @@ public final class ProxyServer: @unchecked Sendable {
     public private(set) var config: ProxyConfig
 
     private let controlQueue = DispatchQueue(label: "com.local.usbproxy.server", qos: .userInitiated)
+    private let workerQueues: [DispatchQueue] = (0..<8).map { i in
+        DispatchQueue(label: "com.local.usbproxy.worker.\(i)", qos: .default)
+    }
+    private let uotQueue = DispatchQueue(label: "com.local.usbproxy.uot", qos: .userInteractive)
+    private var nextWorkerIndex: Int = 0
     private let statsLock = NSLock()
     private let limiter: ConnectionLimiter
     private let logHandler: @Sendable (String) -> Void
@@ -282,11 +287,13 @@ public final class ProxyServer: @unchecked Sendable {
     // MARK: - Connection Acceptance
 
     private func acceptConnection(_ client: NWConnection) {
-        let sessionQueue = DispatchQueue(label: "com.local.usbproxy.conn", qos: .userInitiated)
+        let sessionQueue = workerQueues[nextWorkerIndex % workerQueues.count]
+        nextWorkerIndex &+= 1
         let session = ClientSession(
             client: client,
             config: config,
             queue: sessionQueue,
+            uotQueue: uotQueue,
             onTraffic: { [weak self] up, down in
                 self?.addTraffic(up: up, down: down)
             },
@@ -389,6 +396,7 @@ private final class ClientSession: @unchecked Sendable {
     private let client: NWConnection
     private let config: ProxyConfig
     private let queue: DispatchQueue
+    private let uotQueue: DispatchQueue
     private let onTraffic: @Sendable (_ up: UInt64, _ down: UInt64) -> Void
     private let onDialFailure: @Sendable (String) -> Void
     private let onUDPFlowDelta: @Sendable (_ delta: Int) -> Void
@@ -397,6 +405,7 @@ private final class ClientSession: @unchecked Sendable {
     private var onActivity: @Sendable () -> Void = {}
     private var onUpgradeToUoT: @Sendable () -> Void = {}
     private var onFinished: @Sendable () -> Void = {}
+    private var lastTouchUptime: TimeInterval = 0
 
     private var phase: Phase = .greeting
     private var handshakeBuffer = Data()
@@ -415,6 +424,7 @@ private final class ClientSession: @unchecked Sendable {
         client: NWConnection,
         config: ProxyConfig,
         queue: DispatchQueue,
+        uotQueue: DispatchQueue,
         onTraffic: @escaping @Sendable (_ up: UInt64, _ down: UInt64) -> Void,
         onDialFailure: @escaping @Sendable (String) -> Void,
         onUDPFlowDelta: @escaping @Sendable (_ delta: Int) -> Void,
@@ -423,10 +433,19 @@ private final class ClientSession: @unchecked Sendable {
         self.client = client
         self.config = config
         self.queue = queue
+        self.uotQueue = uotQueue
         self.onTraffic = onTraffic
         self.onDialFailure = onDialFailure
         self.onUDPFlowDelta = onUDPFlowDelta
         self.log = log
+    }
+
+    private func touchThrottledLocked() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastTouchUptime >= 2.0 {
+            lastTouchUptime = now
+            onActivity()
+        }
     }
 
     func bindLifecycle(
@@ -572,6 +591,7 @@ private final class ClientSession: @unchecked Sendable {
 
         phase = .dialing
         let params = NWParameters.tcp
+        params.serviceClass = .responsiveData
         if config.requireCellular {
             params.requiredInterfaceType = .cellular
         }
@@ -652,12 +672,12 @@ private final class ClientSession: @unchecked Sendable {
                 client: self.client,
                 initialData: trailing,
                 config: self.config,
-                queue: self.queue,
+                queue: self.uotQueue,
                 onTraffic: self.onTraffic,
                 onActivity: self.onActivity,
                 onFlowCountDelta: self.onUDPFlowDelta,
                 onClosed: { [weak self] in
-                    self?.closeLocked()
+                    self?.cancel()
                 },
                 log: self.log
             )
@@ -697,7 +717,7 @@ private final class ClientSession: @unchecked Sendable {
             guard let self, self.phase == .relayingTCP else { return }
 
             if let data = content, !data.isEmpty {
-                self.onActivity()
+                self.touchThrottledLocked()
                 if isUpload {
                     self.onTraffic(UInt64(data.count), 0)
                 } else {

@@ -44,8 +44,9 @@ final class UoTRelaySession: @unchecked Sendable {
     private var isWriting = false
     private var closed = false
     private var reaperTimer: DispatchSourceTimer?
+    private var lastActivityTouchUptime: TimeInterval = 0
 
-    private static let maxPendingWriteFrames = 64
+    private static let maxPendingWriteFrames = 128
     private static let maxReadBufferBytes = 256 * 1024
 
     init(
@@ -106,25 +107,36 @@ final class UoTRelaySession: @unchecked Sendable {
         reaperTimer = timer
     }
 
+    private func touchActivityLocked() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastActivityTouchUptime >= 2.0 {
+            lastActivityTouchUptime = now
+            onActivity()
+        }
+    }
+
     private func receiveNextChunk() {
         guard !closed else { return }
         client.receive(minimumIncompleteLength: 1, maximumLength: config.bufferSize) { [weak self] content, _, isComplete, error in
-            guard let self, !self.closed else { return }
-            if let data = content, !data.isEmpty {
-                self.readBuffer.append(data)
-                if self.readBuffer.count > Self.maxReadBufferBytes {
-                    self.log("UoT read buffer overflow, closing stream")
+            guard let self else { return }
+            self.queue.async {
+                guard !self.closed else { return }
+                if let data = content, !data.isEmpty {
+                    self.readBuffer.append(data)
+                    if self.readBuffer.count > Self.maxReadBufferBytes {
+                        self.log("UoT read buffer overflow, closing stream")
+                        self.closeLocked()
+                        return
+                    }
+                    self.touchActivityLocked()
+                    self.processBuffer()
+                }
+                if error != nil || isComplete {
                     self.closeLocked()
                     return
                 }
-                self.onActivity()
-                self.processBuffer()
+                self.receiveNextChunk()
             }
-            if error != nil || isComplete {
-                self.closeLocked()
-                return
-            }
-            self.receiveNextChunk()
         }
     }
 
@@ -206,6 +218,7 @@ final class UoTRelaySession: @unchecked Sendable {
         }
 
         let params = NWParameters.udp
+        params.serviceClass = .interactiveVoice
         if config.requireCellular {
             params.requiredInterfaceType = .cellular
         }
@@ -236,7 +249,7 @@ final class UoTRelaySession: @unchecked Sendable {
             guard let self, let flow, !self.closed, !flow.closed else { return }
             if let data = content, !data.isEmpty {
                 flow.lastActivity = Date()
-                self.onActivity()
+                self.touchActivityLocked()
                 self.onTraffic(0, UInt64(data.count))
                 self.enqueueReplyFrameLocked(payload: data, from: flow.key)
             }
@@ -273,12 +286,14 @@ final class UoTRelaySession: @unchecked Sendable {
         let next = writeQueue.removeFirst()
         client.send(content: next, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            self.isWriting = false
-            if error != nil {
-                self.closeLocked()
-                return
+            self.queue.async {
+                self.isWriting = false
+                if error != nil {
+                    self.closeLocked()
+                    return
+                }
+                self.drainWriteQueueLocked()
             }
-            self.drainWriteQueueLocked()
         })
     }
 

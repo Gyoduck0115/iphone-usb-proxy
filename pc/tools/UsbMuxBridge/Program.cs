@@ -1,5 +1,5 @@
 using System.Buffers.Binary;
-using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,10 +9,11 @@ using System.Xml.Linq;
 // UsbMuxBridge: Zero-dependency Windows companion tool for iphone-usb-proxy.
 // Subcommands:
 //   devices [--json]                  : Query Apple Mobile Device Service (127.0.0.1:27015) for USB iPhones.
-//   forward <localPort> <devicePort> [--udid <serial>]
-//                                     : Native usbmux TCP forwarder (drop-in fallback for iproxy).
+//   forward <localPort> <devicePort> [--udid <serial>] [--bulk-cap-mbps <N>]
+//                                     : Native usbmux TCP forwarder with cached DeviceID, bounded socket buffers
+//                                       (anti-bufferbloat), and automatic QoS pacing for bulk TCP while VoIP/UoT is active.
 //   mock-server [--port 1080]         : Local SOCKS5 + SagerNet UoT v1/v2 server for Stage 0/3 PC verification.
-//   selftest                          : End-to-end protocol test suite (SOCKS5 TCP + UoT v1 + UoT v2 + usbmuxd check).
+//   selftest                          : End-to-end protocol + QoS test suite.
 
 if (args.Length == 0 || args[0] is "-h" or "--help")
 {
@@ -58,11 +59,11 @@ catch (Exception ex)
 static void PrintUsage()
 {
     Console.WriteLine("""
-    UsbMuxBridge - Apple usbmuxd forwarder & local SOCKS5/UoT verification tool
+    UsbMuxBridge - Apple usbmuxd forwarder (with anti-bufferbloat QoS) & local SOCKS5/UoT verification tool
 
     Usage:
       UsbMuxBridge devices [--json]
-      UsbMuxBridge forward <localPort> <devicePort> [--udid <serial>]
+      UsbMuxBridge forward <localPort> <devicePort> [--udid <serial>] [--bulk-cap-mbps <N>]
       UsbMuxBridge mock-server [--port 1080]
       UsbMuxBridge selftest
     """);
@@ -96,26 +97,33 @@ static async Task<int> RunForwardAsync(string[] subArgs, CancellationToken ct)
         localPort is < 1 or > 65535 ||
         devicePort is < 1 or > 65535)
     {
-        Console.Error.WriteLine("Usage: UsbMuxBridge forward <localPort> <devicePort> [--udid <serial>]");
+        Console.Error.WriteLine("Usage: UsbMuxBridge forward <localPort> <devicePort> [--udid <serial>] [--bulk-cap-mbps <N>]");
         return 2;
     }
 
     string? udid = null;
+    double bulkCapMbps = 12.0; // Applied to bulk (>512KB) TCP streams ONLY while UoT/Voice traffic is active
     for (int i = 2; i < subArgs.Length - 1; i++)
     {
         if (subArgs[i] == "--udid") udid = subArgs[i + 1];
+        if (subArgs[i] == "--bulk-cap-mbps" && double.TryParse(subArgs[i + 1], out double parsedCap) && parsedCap >= 0)
+            bulkCapMbps = parsedCap;
     }
 
+    var deviceCache = new UsbDeviceCache(udid);
+    var qos = new QoSController(bulkCapMbps);
+
     var listener = new TcpListener(IPAddress.Loopback, localPort);
-    listener.Start();
-    Console.WriteLine($"[usbmux] Listening on 127.0.0.1:{localPort} -> iPhone:{devicePort} (Ctrl+C to stop)");
+    listener.Start(backlog: 128);
+    string capLabel = bulkCapMbps > 0 ? $"{bulkCapMbps:0.#} Mbps while VoIP/UDP active" : "disabled";
+    Console.WriteLine($"[usbmux] Listening on 127.0.0.1:{localPort} -> iPhone:{devicePort} (QoS bulk cap: {capLabel}, Ctrl+C to stop)");
 
     try
     {
         while (!ct.IsCancellationRequested)
         {
             var client = await listener.AcceptTcpClientAsync(ct);
-            _ = HandleForwardedClientAsync(client, devicePort, udid, ct);
+            _ = HandleForwardedClientAsync(client, devicePort, deviceCache, qos, ct);
         }
     }
     finally
@@ -125,34 +133,50 @@ static async Task<int> RunForwardAsync(string[] subArgs, CancellationToken ct)
     return 0;
 }
 
-static async Task HandleForwardedClientAsync(TcpClient localClient, int devicePort, string? udid, CancellationToken ct)
+static async Task HandleForwardedClientAsync(
+    TcpClient localClient,
+    int devicePort,
+    UsbDeviceCache deviceCache,
+    QoSController qos,
+    CancellationToken ct)
 {
     using (localClient)
     {
-        localClient.NoDelay = true;
+        ConfigureSocket(localClient);
         try
         {
-            var devices = await UsbMuxClient.ListDevicesAsync(ct);
-            var usbDevices = devices.Where(d => string.Equals(d.ConnectionType, "USB", StringComparison.OrdinalIgnoreCase)).ToList();
-            var target = udid is not null
-                ? usbDevices.FirstOrDefault(d => string.Equals(d.SerialNumber, udid, StringComparison.OrdinalIgnoreCase))
-                : usbDevices.FirstOrDefault();
-
-            if (target is null)
+            TcpClient? deviceClient = null;
+            int deviceId = await deviceCache.GetDeviceIdAsync(forceRefresh: false, ct);
+            if (deviceId <= 0)
             {
                 Console.Error.WriteLine("[usbmux] No USB iPhone detected (is it unlocked and trusted?)");
                 return;
             }
 
-            using var deviceClient = await UsbMuxClient.ConnectDevicePortAsync(target.DeviceId, (ushort)devicePort, ct);
-            deviceClient.NoDelay = true;
+            try
+            {
+                deviceClient = await UsbMuxClient.ConnectDevicePortAsync(deviceId, (ushort)devicePort, ct);
+            }
+            catch
+            {
+                // Device may have replugged with a new DeviceID; refresh cache once and retry.
+                deviceId = await deviceCache.GetDeviceIdAsync(forceRefresh: true, ct);
+                if (deviceId <= 0) throw;
+                deviceClient = await UsbMuxClient.ConnectDevicePortAsync(deviceId, (ushort)devicePort, ct);
+            }
 
-            var localStream = localClient.GetStream();
-            var deviceStream = deviceClient.GetStream();
+            using (deviceClient)
+            {
+                ConfigureSocket(deviceClient);
+                var state = new StreamQoSState();
 
-            var t1 = PumpHalfCloseAsync(localStream, deviceClient, deviceStream, ct);
-            var t2 = PumpHalfCloseAsync(deviceStream, localClient, localStream, ct);
-            await Task.WhenAll(t1, t2);
+                var localStream = localClient.GetStream();
+                var deviceStream = deviceClient.GetStream();
+
+                var t1 = PumpWithQoSAsync(localStream, deviceClient, deviceStream, isUpload: true, state, qos, ct);
+                var t2 = PumpWithQoSAsync(deviceStream, localClient, localStream, isUpload: false, state, qos, ct);
+                await Task.WhenAll(t1, t2);
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -161,15 +185,52 @@ static async Task HandleForwardedClientAsync(TcpClient localClient, int devicePo
     }
 }
 
-static async Task PumpHalfCloseAsync(NetworkStream src, TcpClient dstClient, NetworkStream dst, CancellationToken ct)
+static void ConfigureSocket(TcpClient client)
 {
-    byte[] buffer = new byte[32 * 1024];
+    client.NoDelay = true;
+    // Keep socket buffers modest (32 KB) so bulk downloads cannot fill megabytes of bufferbloat
+    // inside AppleMobileDeviceProcess's shared USB bulk pipe.
+    client.SendBufferSize = 32 * 1024;
+    client.ReceiveBufferSize = 32 * 1024;
+}
+
+static async Task PumpWithQoSAsync(
+    NetworkStream src,
+    TcpClient dstClient,
+    NetworkStream dst,
+    bool isUpload,
+    StreamQoSState state,
+    QoSController qos,
+    CancellationToken ct)
+{
+    const int NormalChunk = 16 * 1024;
+    const int BulkChunk = 8 * 1024;
+    byte[] buffer = new byte[NormalChunk];
+
     try
     {
         while (true)
         {
-            int n = await src.ReadAsync(buffer, ct);
+            int maxRead = state.IsBulk ? BulkChunk : NormalChunk;
+            int n = await src.ReadAsync(buffer.AsMemory(0, maxRead), ct);
             if (n == 0) break;
+
+            if (isUpload)
+            {
+                state.InspectUploadHeader(buffer.AsSpan(0, n));
+            }
+
+            state.AddBytes(n);
+
+            if (state.IsVoiceUoT)
+            {
+                qos.MarkVoiceActivity();
+            }
+            else if (state.IsBulk)
+            {
+                await qos.PaceBulkAsync(n, ct);
+            }
+
             await dst.WriteAsync(buffer.AsMemory(0, n), ct);
         }
         try { dstClient.Client.Shutdown(SocketShutdown.Send); } catch { }
@@ -200,7 +261,7 @@ static async Task<int> RunMockServerAsync(string[] subArgs, CancellationToken ct
 static async Task<int> RunSelfTestAsync(CancellationToken parentCt)
 {
     using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(parentCt);
-    timeoutCts.CancelAfter(TimeSpan.FromSeconds(15));
+    timeoutCts.CancelAfter(TimeSpan.FromSeconds(20));
     var ct = timeoutCts.Token;
 
     Console.WriteLine("1) Checking Apple Mobile Device Service (usbmuxd 127.0.0.1:27015)...");
@@ -230,7 +291,7 @@ static async Task<int> RunSelfTestAsync(CancellationToken parentCt)
                     using (c)
                     {
                         var s = c.GetStream();
-                        byte[] buf = new byte[4096];
+                        byte[] buf = new byte[16 * 1024];
                         int n;
                         while ((n = await s.ReadAsync(buf, ct)) > 0)
                             await s.WriteAsync(buf.AsMemory(0, n), ct);
@@ -244,7 +305,6 @@ static async Task<int> RunSelfTestAsync(CancellationToken parentCt)
     await using var proxy = new LocalSocksUoTServer(0);
     int proxyPort = proxy.Start();
 
-    // Test SOCKS5 TCP CONNECT IPv4
     using (var client = new TcpClient())
     {
         await client.ConnectAsync(IPAddress.Loopback, proxyPort, ct);
@@ -281,13 +341,40 @@ static async Task<int> RunSelfTestAsync(CancellationToken parentCt)
         }
     }, ct);
 
-    // UoT v2 non-connect test
     await TestUoTV2Async(proxyPort, udpEchoPort, isConnect: false, ct);
-    // UoT v2 connect test
     await TestUoTV2Async(proxyPort, udpEchoPort, isConnect: true, ct);
-    // UoT v1 test
     await TestUoTV1Async(proxyPort, udpEchoPort, ct);
     Console.WriteLine("   OK: UoT v1 and UoT v2 (connect & non-connect) passed.");
+
+    Console.WriteLine("4) Testing QoS classifier & voice-active bulk token bucket...");
+    var uotState = new StreamQoSState();
+    byte[] fakeUoTHandshake = Encoding.ASCII.GetBytes("\x05\x01\x00\x05\x01\x00\x03\x17sp.v2.udp-over-tcp.arpa\x00\x00");
+    uotState.InspectUploadHeader(fakeUoTHandshake);
+    if (!uotState.IsVoiceUoT || uotState.IsBulk) throw new Exception("UoT stream not classified as VoiceUoT");
+
+    var dnsState = new StreamQoSState();
+    byte[] fakeDnsHandshake = { 0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xBB };
+    dnsState.InspectUploadHeader(fakeDnsHandshake);
+    if (!dnsState.IsHighPriority || dnsState.IsBulk) throw new Exception("DoH stream not classified as HighPriority");
+
+    var bulkState = new StreamQoSState();
+    byte[] fakeHttpHandshake = { 0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34, 0x01, 0xBB };
+    bulkState.InspectUploadHeader(fakeHttpHandshake);
+    if (bulkState.IsBulk) throw new Exception("New TCP stream should not start as Bulk");
+    bulkState.AddBytes(600 * 1024);
+    if (!bulkState.IsBulk) throw new Exception("Large TCP stream should transition to Bulk after 512 KB");
+
+    var qos = new QoSController(bulkCapMbps: 8.0); // 1 MB/s while voice active
+    qos.MarkVoiceActivity();
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < 40; i++)
+    {
+        await qos.PaceBulkAsync(8 * 1024, ct); // 320 KB at 1 MB/s -> ~200-350 ms
+    }
+    sw.Stop();
+    if (sw.ElapsedMilliseconds < 120)
+        throw new Exception($"Bulk pacing too fast ({sw.ElapsedMilliseconds}ms for 320KB at 8Mbps)");
+    Console.WriteLine($"   OK: QoS classifier & bulk pacing verified (320 KB paced in {sw.ElapsedMilliseconds} ms while voice active).");
 
     tcpEcho.Stop();
     udpEcho.Close();
@@ -312,7 +399,6 @@ static async Task TestUoTV2Async(int proxyPort, int udpEchoPort, bool isConnect,
     byte[] rep = await StreamIo.ReadExactAsync(s, 10, ct);
     if (rep[1] != 0x00) throw new Exception("UoT v2 CONNECT failed");
 
-    // V2 request header: [isConnect][Socksaddr: 0x01 IPv4 127.0.0.1 port]
     byte[] v2Header = { (byte)(isConnect ? 1 : 0), 0x01, 127, 0, 0, 1, (byte)(udpEchoPort >> 8), (byte)(udpEchoPort & 0xff) };
     byte[] payload = Encoding.UTF8.GetBytes(isConnect ? "uot-v2-connect" : "uot-v2-packet");
 
@@ -320,7 +406,6 @@ static async Task TestUoTV2Async(int proxyPort, int udpEchoPort, bool isConnect,
     frame.Write(v2Header);
     if (!isConnect)
     {
-        // UoT AddrParser ATYP: 0x00=IPv4
         frame.Write(new byte[] { 0x00, 127, 0, 0, 1, (byte)(udpEchoPort >> 8), (byte)(udpEchoPort & 0xff) });
     }
     frame.Write(new byte[] { (byte)(payload.Length >> 8), (byte)(payload.Length & 0xff) });
@@ -329,7 +414,7 @@ static async Task TestUoTV2Async(int proxyPort, int udpEchoPort, bool isConnect,
 
     if (!isConnect)
     {
-        byte[] addrHdr = await StreamIo.ReadExactAsync(s, 7, ct); // 0x00 + 4B IPv4 + 2B port
+        byte[] addrHdr = await StreamIo.ReadExactAsync(s, 7, ct);
         if (addrHdr[0] != 0x00) throw new Exception($"Expected UoT IPv4 ATYP 0x00, got {addrHdr[0]}");
     }
     byte[] lenBytes = await StreamIo.ReadExactAsync(s, 2, ct);
@@ -369,6 +454,175 @@ static async Task TestUoTV1Async(int proxyPort, int udpEchoPort, CancellationTok
     int len = BinaryPrimitives.ReadUInt16BigEndian(lenBytes);
     byte[] reply = await StreamIo.ReadExactAsync(s, len, ct);
     if (!reply.SequenceEqual(payload)) throw new Exception("UoT v1 echo mismatch");
+}
+
+// MARK: - Device Cache (eliminates per-connection ListDevices storm against AppleMobileDeviceProcess)
+
+sealed class UsbDeviceCache
+{
+    private readonly string? _udid;
+    private readonly SemaphoreSlim _lock = new(1, 1);
+    private int _cachedDeviceId;
+    private long _cachedAtMs;
+    private const long CacheTtlMs = 30_000;
+
+    public UsbDeviceCache(string? udid)
+    {
+        _udid = udid;
+    }
+
+    public async Task<int> GetDeviceIdAsync(bool forceRefresh, CancellationToken ct)
+    {
+        long now = Environment.TickCount64;
+        if (!forceRefresh && _cachedDeviceId > 0 && (now - Volatile.Read(ref _cachedAtMs)) < CacheTtlMs)
+        {
+            return _cachedDeviceId;
+        }
+
+        await _lock.WaitAsync(ct);
+        try
+        {
+            now = Environment.TickCount64;
+            if (!forceRefresh && _cachedDeviceId > 0 && (now - _cachedAtMs) < CacheTtlMs)
+            {
+                return _cachedDeviceId;
+            }
+
+            var devices = await UsbMuxClient.ListDevicesAsync(ct);
+            var usbDevices = devices.Where(d => string.Equals(d.ConnectionType, "USB", StringComparison.OrdinalIgnoreCase)).ToList();
+            var target = _udid is not null
+                ? usbDevices.FirstOrDefault(d => string.Equals(d.SerialNumber, _udid, StringComparison.OrdinalIgnoreCase))
+                : usbDevices.FirstOrDefault();
+
+            _cachedDeviceId = target?.DeviceId ?? 0;
+            Volatile.Write(ref _cachedAtMs, Environment.TickCount64);
+            return _cachedDeviceId;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+}
+
+// MARK: - Transparent SOCKS5-aware QoS Classifier & Voice-Active Bulk Pacer
+
+sealed class StreamQoSState
+{
+    private const long BulkThresholdBytes = 512 * 1024; // First 512 KB of every TCP flow stays interactive/unthrottled
+    private const int InspectLimit = 320;
+    private static readonly byte[] UotNeedle = Encoding.ASCII.GetBytes("udp-over-tcp.arpa");
+    private static readonly byte[] Dns1111 = { 0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xBB };
+    private static readonly byte[] Dns8888Tcp = { 0x05, 0x01, 0x00, 0x01, 8, 8, 8, 8, 0x00, 0x35 };
+    private static readonly byte[] Dns8888Https = { 0x05, 0x01, 0x00, 0x01, 8, 8, 8, 8, 0x01, 0xBB };
+
+    private byte[]? _headerBuf = new byte[InspectLimit];
+    private int _headerLen;
+    private long _totalBytes;
+    private int _class; // 0 = normal, 1 = high (DNS), 2 = voice (UoT)
+
+    public bool IsVoiceUoT => Volatile.Read(ref _class) == 2;
+    public bool IsHighPriority => Volatile.Read(ref _class) >= 1;
+    public bool IsBulk => Volatile.Read(ref _class) == 0 && Interlocked.Read(ref _totalBytes) >= BulkThresholdBytes;
+
+    public void AddBytes(int count)
+    {
+        Interlocked.Add(ref _totalBytes, count);
+    }
+
+    public void InspectUploadHeader(ReadOnlySpan<byte> chunk)
+    {
+        var buf = _headerBuf;
+        if (buf is null || Volatile.Read(ref _class) == 2) return;
+
+        int take = Math.Min(chunk.Length, buf.Length - _headerLen);
+        if (take > 0)
+        {
+            chunk.Slice(0, take).CopyTo(buf.AsSpan(_headerLen));
+            _headerLen += take;
+        }
+
+        ReadOnlySpan<byte> seen = buf.AsSpan(0, _headerLen);
+        if (seen.IndexOf(UotNeedle) >= 0)
+        {
+            Volatile.Write(ref _class, 2);
+            _headerBuf = null;
+            return;
+        }
+        if (seen.IndexOf(Dns1111) >= 0 || seen.IndexOf(Dns8888Tcp) >= 0 || seen.IndexOf(Dns8888Https) >= 0)
+        {
+            Volatile.Write(ref _class, 1);
+            _headerBuf = null;
+            return;
+        }
+        if (_headerLen >= buf.Length)
+        {
+            _headerBuf = null;
+        }
+    }
+}
+
+sealed class QoSController
+{
+    private const long VoiceActiveWindowMs = 3_000;
+    private readonly double _bulkBytesPerSec;
+    private readonly double _burstBytes;
+    private readonly object _lock = new();
+    private double _tokens;
+    private long _lastRefillMs;
+    private long _lastVoiceActivityMs;
+
+    public QoSController(double bulkCapMbps)
+    {
+        _bulkBytesPerSec = bulkCapMbps > 0 ? (bulkCapMbps * 1_000_000.0 / 8.0) : 0;
+        _burstBytes = Math.Max(32 * 1024, _bulkBytesPerSec * 0.08); // 80 ms small burst to keep queues shallow
+        _tokens = _burstBytes;
+        _lastRefillMs = Environment.TickCount64;
+        _lastVoiceActivityMs = -VoiceActiveWindowMs - 1;
+    }
+
+    public void MarkVoiceActivity()
+    {
+        Volatile.Write(ref _lastVoiceActivityMs, Environment.TickCount64);
+    }
+
+    public bool IsVoiceActive()
+    {
+        long last = Volatile.Read(ref _lastVoiceActivityMs);
+        return (Environment.TickCount64 - last) <= VoiceActiveWindowMs;
+    }
+
+    public async ValueTask PaceBulkAsync(int bytes, CancellationToken ct)
+    {
+        if (_bulkBytesPerSec <= 0 || !IsVoiceActive())
+        {
+            return;
+        }
+
+        int waitMs = 0;
+        lock (_lock)
+        {
+            long now = Environment.TickCount64;
+            long elapsed = now - _lastRefillMs;
+            if (elapsed > 0)
+            {
+                _tokens = Math.Min(_burstBytes, _tokens + (_bulkBytesPerSec * elapsed / 1000.0));
+                _lastRefillMs = now;
+            }
+
+            _tokens -= bytes;
+            if (_tokens < 0)
+            {
+                double deficitSec = (-_tokens) / _bulkBytesPerSec;
+                waitMs = (int)Math.Clamp(Math.Ceiling(deficitSec * 1000.0), 1, 250);
+            }
+        }
+
+        if (waitMs > 0)
+        {
+            await Task.Delay(waitMs, ct);
+        }
+    }
 }
 
 // MARK: - Apple usbmuxd Plist Protocol Client (Windows 127.0.0.1:27015)
@@ -414,7 +668,6 @@ static class UsbMuxClient
             await tcp.ConnectAsync(IPAddress.Loopback, UsbMuxPort, ct);
             var stream = tcp.GetStream();
 
-            // Apple usbmuxd expects PortNumber in network byte order (big-endian swapped inside the integer!).
             ushort swappedPort = BinaryPrimitives.ReverseEndianness(devicePort);
             string plist = $"""
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -554,7 +807,6 @@ sealed class LocalSocksUoTServer : IAsyncDisposable
             var stream = client.GetStream();
             try
             {
-                // 1. Greeting
                 byte[] hdr = await StreamIo.ReadExactAsync(stream, 2, ct);
                 if (hdr[0] != 0x05) return;
                 byte[] methods = await StreamIo.ReadExactAsync(stream, hdr[1], ct);
@@ -565,7 +817,6 @@ sealed class LocalSocksUoTServer : IAsyncDisposable
                 }
                 await stream.WriteAsync(new byte[] { 0x05, 0x00 }, ct);
 
-                // 2. Request
                 byte[] reqHdr = await StreamIo.ReadExactAsync(stream, 3, ct);
                 if (reqHdr[0] != 0x05 || reqHdr[1] != 0x01)
                 {
@@ -728,7 +979,7 @@ sealed class LocalSocksUoTServer : IAsyncDisposable
 
     private static async Task RelayHalfCloseAsync(NetworkStream src, TcpClient dstClient, NetworkStream dst, CancellationToken ct)
     {
-        byte[] buf = new byte[32 * 1024];
+        byte[] buf = new byte[16 * 1024];
         try
         {
             while (true)

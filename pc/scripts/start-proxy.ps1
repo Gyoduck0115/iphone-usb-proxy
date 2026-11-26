@@ -23,6 +23,9 @@ param(
 
     [string]$Udid = "",
 
+    # Cap bulk (>512KB) TCP streams in Mbps while VoIP/UDP (Discord) is active (0 = unlimited)
+    [double]$BulkCapMbps = 12,
+
     # Open usbmux SOCKS5 port (127.0.0.1:1080) without starting sing-box TUN (no Admin needed)
     [switch]$SocksOnly
 )
@@ -240,6 +243,16 @@ if ($DevicePort -le 0) {
 # Clean up stale UsbMuxBridge/iproxy holding LocalPort before starting a new forwarder
 Ensure-LocalPortFree -Port $LocalPort
 
+# Auto-sync newer built UsbMuxBridge binaries once any old instance is stopped
+$freshBridgeDir = Join-Path $ProjectRoot "pc\tools\UsbMuxBridge\bin\Release\net10.0"
+$targetBridgeDir = Join-Path $BinDir "UsbMuxBridge"
+$freshDll = Join-Path $freshBridgeDir "UsbMuxBridge.dll"
+$targetDll = Join-Path $targetBridgeDir "UsbMuxBridge.dll"
+if ((Test-Path $freshDll) -and ((-not (Test-Path $targetDll)) -or ((Get-Item $freshDll).LastWriteTimeUtc -gt (Get-Item $targetDll).LastWriteTimeUtc))) {
+    New-Item -ItemType Directory -Force -Path $targetBridgeDir | Out-Null
+    Copy-Item -Path (Join-Path $freshBridgeDir "*") -Destination $targetBridgeDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # 3. Capture pre-start default routes
 $beforeRoutes = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
     Select-Object InterfaceAlias, NextHop, RouteMetric
@@ -255,7 +268,9 @@ $fwdArgs = switch ($fwd.Kind) {
         if ($Udid) { @("usbmux", "forward", "$LocalPort", "$DevicePort", "--udid", $Udid) } else { @("usbmux", "forward", "$LocalPort", "$DevicePort") }
     }
     "bridge" {
-        if ($Udid) { @("forward", "$LocalPort", "$DevicePort", "--udid", $Udid) } else { @("forward", "$LocalPort", "$DevicePort") }
+        $bArgs = @("forward", "$LocalPort", "$DevicePort", "--bulk-cap-mbps", "$BulkCapMbps")
+        if ($Udid) { $bArgs += @("--udid", $Udid) }
+        $bArgs
     }
 }
 

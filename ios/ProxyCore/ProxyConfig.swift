@@ -68,17 +68,18 @@ public struct ProxyConfig: Equatable, Codable, Sendable {
     }
 
     /// Standard configuration when running inside the main app process.
+    /// Uses 16 KB relay chunks to keep per-socket loopback/USB bufferbloat low so VoIP/UoT stays responsive.
     public static let appDefault = ProxyConfig(
         listenPort: 1080,
         requireCellular: true,
         enableUDP: true,
-        maxConnections: 256,
+        maxConnections: 512,
         maxUDPFlowsPerStream: 64,
-        bufferSize: 32 * 1024,
+        bufferSize: 16 * 1024,
         handshakeTimeout: 10,
         dialTimeout: 15,
-        tcpIdleTimeout: 300,
-        halfCloseTimeout: 15,
+        tcpIdleTimeout: 120,
+        halfCloseTimeout: 10,
         udpIdleTimeout: 60,
         udpDNSIdleTimeout: 20,
         tcpKeepaliveIdle: 600,

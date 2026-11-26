@@ -39,7 +39,7 @@
       "mtu": 1500,
       "auto_route": true,
       "strict_route": true,
-      "stack": "system"
+      "stack": "mixed"
     }
   ],
   "outbounds": [
@@ -71,6 +71,15 @@
       {
         "ip_is_private": true,
         "outbound": "direct"
+      },
+      {
+        "protocol": "quic",
+        "action": "reject"
+      },
+      {
+        "network": "udp",
+        "port": [443],
+        "action": "reject"
       }
     ],
     "final": "socks-out",
